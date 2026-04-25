@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Test Web Server</title>
+<style>
+  body { font-family: sans-serif; background: #1a1a2e; color: #eee; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+  .card { background: #16213e; border: 1px solid #0f3460; border-radius: 12px; padding: 40px 60px; text-align: center; box-shadow: 0 4px 20px rgba(0,0,0,0.4); }
+  h1 { color: #e94560; margin-bottom: 8px; }
+  .badge { display: inline-block; background: #0f3460; border-radius: 20px; padding: 4px 14px; font-size: 0.85em; margin: 4px; }
+  .status { margin-top: 20px; color: #4caf50; font-size: 1.1em; }
+  code { background: #0f3460; padding: 2px 8px; border-radius: 4px; font-size: 0.9em; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Test Web Server</h1>
+  <p>Zabbix デモ用テストサーバです</p>
+  <div>
+    <span class="badge">Nginx</span>
+    <span class="badge">Zabbix Agent2</span>
+    <span class="badge">Alpine Linux</span>
+  </div>
+  <div class="status">&#10003; Running</div>
+  <p style="margin-top:20px; color:#aaa; font-size:0.85em;">
+    Nginx metrics: <code>/nginx_status</code>
+  </p>
+</div>
+</body>
+</html>
