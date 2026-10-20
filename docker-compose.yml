@@ -46,6 +46,14 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       ZBX_STARTPINGERS: 5
       ZBX_TIMEOUT: 10
+      # Connector workers for real-time streaming (StartConnectors).
+      # Must be >= the connector's concurrent sessions (1 in this lab).
+      ZBX_STARTCONNECTORS: ${ZBX_STARTCONNECTORS:-1}
+      # Seconds between configuration cache reloads (picks up connector changes).
+      ZBX_CACHEUPDATEFREQUENCY: ${ZBX_CACHEUPDATEFREQUENCY:-10}
+    extra_hosts:
+      # Lets the server reach apps on the Docker host on Linux; no-op on Docker Desktop.
+      - "host.docker.internal:host-gateway"
     ports:
       - "10051:10051"
     networks:
@@ -147,9 +155,55 @@ services:
     depends_on:
       zabbix-web:
         condition: service_healthy
+    environment:
+      # Read only by init/setup-streaming.sh, which translates them into a
+      # Zabbix connector through the API. Zabbix itself never reads them.
+      STREAMING_ENABLED: ${STREAMING_ENABLED:-false}
+      STREAMING_URL: ${STREAMING_URL:-}
+      STREAMING_BEARER_TOKEN: ${STREAMING_BEARER_TOKEN:-}
+      ZBX_CACHEUPDATEFREQUENCY: ${ZBX_CACHEUPDATEFREQUENCY:-10}
     volumes:
       - ./init:/init:ro
-    command: sh /init/setup-hosts.sh
+    command: sh -c "sh /init/setup-hosts.sh && sh /init/setup-streaming.sh"
     networks:
       - zabbix-net
     restart: "no"
+
+  # ─────────────────────────────────────────
+  # Sensor simulator: pushes temperature, voltage and humidity
+  # for 5 simulated hosts to Zabbix trapper items (zabbix_sender).
+  # Talks to zabbix-server only, never to the stream receiver.
+  # ─────────────────────────────────────────
+  sensor-simulator:
+    image: zabbix/zabbix-agent2:alpine-7.0-latest
+    container_name: sensor-simulator
+    depends_on:
+      zabbix-init:
+        condition: service_completed_successfully
+    environment:
+      ZABBIX_SERVER: zabbix-server
+      SIM_INTERVAL: ${SIM_INTERVAL:-10}
+    volumes:
+      - ./simulator:/simulator:ro
+    entrypoint: ["sh", "/simulator/simulate.sh"]
+    networks:
+      - zabbix-net
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  # Diagnostic stream receiver (profile: streaming-test)
+  # Receives Zabbix native NDJSON streaming and logs each metric.
+  # ─────────────────────────────────────────
+  stream-receiver:
+    build: ./test-servers/stream-receiver
+    container_name: stream-receiver
+    profiles: ["streaming-test"]
+    environment:
+      RECEIVER_PORT: 8090
+      RECEIVER_EXPECTED_TOKEN: ${STREAMING_BEARER_TOKEN:-}
+      RECEIVER_LOG_RAW: ${RECEIVER_LOG_RAW:-false}
+    ports:
+      - "8090:8090"
+    networks:
+      - zabbix-net
+    restart: unless-stopped

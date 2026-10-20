@@ -53,13 +53,19 @@ demo-zabbix/
 ├── docker-compose.yml          # All service definitions
 ├── .env.example                # Environment variable template
 ├── init/
-│   └── setup-hosts.sh          # Auto-registers test hosts via Zabbix API on first boot
+│   ├── setup-hosts.sh          # Auto-registers test hosts via Zabbix API on first boot
+│   └── setup-streaming.sh      # Simulated sensor hosts + streaming connector (runs every time)
+├── simulator/
+│   └── simulate.sh             # Pushes sensor readings to Zabbix with zabbix_sender
 └── test-servers/
-    └── web/
-        ├── Dockerfile           # Custom image: Nginx + Zabbix Agent2
-        ├── docker-entrypoint.sh # Starts nginx then hands off to the agent entrypoint
-        ├── nginx.conf           # Nginx config (exposes /nginx_status for metrics)
-        └── html/index.html      # Test web page
+    ├── web/
+    │   ├── Dockerfile           # Custom image: Nginx + Zabbix Agent2
+    │   ├── docker-entrypoint.sh # Starts nginx then hands off to the agent entrypoint
+    │   ├── nginx.conf           # Nginx config (exposes /nginx_status for metrics)
+    │   └── html/index.html      # Test web page
+    └── stream-receiver/
+        ├── Dockerfile           # Diagnostic NDJSON receiver (profile: streaming-test)
+        └── receiver.py
 ```
 
 ### Containers
@@ -103,7 +109,9 @@ demo-zabbix/
 | `test-linux-1` | zabbix-agent2:7.0 | Test Linux server #1 |
 | `test-linux-2` | zabbix-agent2:7.0 | Test Linux server #2 |
 | `test-web-server` | custom build | Nginx + Zabbix Agent2, exposes port 8081 |
-| `zabbix-init` | alpine:3.19 | Registers test hosts via API on first boot (runs once) |
+| `zabbix-init` | alpine:3.19 | Registers test hosts via API on first boot, syncs simulated sensors and the streaming connector (exits after setup) |
+| `sensor-simulator` | zabbix-agent2:7.0 | Sends temperature, voltage and humidity for `sim-sensor-01..05` to trapper items |
+| `stream-receiver` | custom build | Diagnostic streaming receiver, port 8090. **Only with `--profile streaming-test`** |
 
 ### Applied Templates
 
@@ -305,6 +313,180 @@ Template: "Linux by Zabbix agent"
 
 ---
 
+## Metrics Streaming
+
+Zabbix 7.0 can push collected item values in real time to an external HTTP endpoint through
+**connectors**. This lab wires the full flow:
+
+```
+sensor-simulator ──zabbix_sender──► zabbix-server ──connector (HTTP POST, NDJSON)──► consumer
+                                         │                                          (stream-receiver
+                                         └── only items tagged stream=demo           or your app)
+```
+
+References for the deployed version (7.0 LTS covers everything needed; no upgrade to 8.0):
+
+- [Streaming to external systems](https://www.zabbix.com/documentation/7.0/en/manual/config/export/streaming)
+- [Real-time export protocol](https://www.zabbix.com/documentation/7.0/en/manual/appendix/protocols/real_time_export)
+- [Connector API object](https://www.zabbix.com/documentation/7.0/en/manual/api/reference/connector/object)
+
+### What gets exported
+
+`setup-streaming.sh` creates the group **Simulated Sensors** with hosts `sim-sensor-01` … `sim-sensor-05`,
+each with three trapper items fed by `sensor-simulator`:
+
+| Item key | Name | Item tag | Streamed |
+|---|---|---|---|
+| `sim.temperature` | Temperature | `stream=demo` | Yes |
+| `sim.voltage` | Voltage | `stream=demo` | Yes |
+| `sim.humidity` | Humidity | — | No (proves the filter works) |
+
+Metrics from the agent hosts (`test-linux-*`, `test-web-server`, Zabbix server) carry no `stream=demo` tag and
+are never streamed.
+
+The managed connector is named **`demo-zabbix-streaming`**:
+
+| Connector setting | Value |
+|---|---|
+| Data type | Item values (no events) |
+| Type of information | Numeric (float) |
+| Tag filter | `stream` Equals `demo` |
+| Concurrent sessions | 1 |
+| HTTP authentication | Bearer if `STREAMING_BEARER_TOKEN` is set, otherwise None |
+
+### Configuration variables
+
+Set them in `.env` or in the shell.
+
+| Variable | Default | Read by | Purpose |
+|---|---|---|---|
+| `ZBX_STARTCONNECTORS` | `1` | Zabbix Server image | Writes `StartConnectors`. Must be ≥ the connector's concurrent sessions. Needs `docker compose up -d zabbix-server` to apply |
+| `ZBX_CACHEUPDATEFREQUENCY` | `10` | Zabbix Server image | Seconds between configuration cache reloads |
+| `STREAMING_ENABLED` | `false` | `setup-streaming.sh` | `true` creates/updates the connector; `false` disables it if it exists |
+| `STREAMING_URL` | — | `setup-streaming.sh` | Full receiver URL. Required (`http(s)://host…`) when enabled; otherwise init exits with code 2 and changes nothing |
+| `STREAMING_BEARER_TOKEN` | — | `setup-streaming.sh` | Optional bearer token |
+| `RECEIVER_LOG_RAW` | `false` | `stream-receiver` | Log the raw request body |
+
+**`STREAMING_*` are not Zabbix variables.** They belong to our initializer, which translates them into the
+connector configuration through the Zabbix API (`connector.create` / `connector.update`).
+
+The initializer is idempotent: it looks the connector up by name, so re-running it never creates a duplicate.
+It only touches `demo-zabbix-streaming`; any other connector is left alone. Tokens are never printed
+(logs only show `bearer: yes/no`) and must never be committed (`.env` is git-ignored).
+
+### Verify the server configuration
+
+```bash
+docker exec zabbix-server grep -E '^(StartConnectors|CacheUpdateFrequency)' /etc/zabbix/zabbix_server.conf
+# StartConnectors=1
+# CacheUpdateFrequency=10
+
+docker compose logs zabbix-server | grep connector
+# ... started [connector manager #1]
+# ... started [connector worker #1]
+```
+
+### Test with the diagnostic receiver
+
+One command enables the profile, enables streaming, points the connector to the receiver and re-runs the
+initializer (`--force-recreate` is needed because `zabbix-init` has already exited):
+
+```bash
+STREAMING_ENABLED=true \
+STREAMING_URL=http://stream-receiver:8090/v1/history \
+docker compose --profile streaming-test up -d --build --force-recreate zabbix-init stream-receiver
+
+docker compose logs -f stream-receiver
+# sim-sensor-01 | Temperature | 23.97 | clock=... | itemid=... | tags=stream=demo
+# sim-sensor-01 | Voltage | 234.5 | clock=... | itemid=... | tags=stream=demo
+# ...
+# POST /v1/history: 10 records        ← 5 hosts × 2 metrics, no Humidity
+```
+
+- With a token: add `STREAMING_BEARER_TOKEN=...`. The receiver then requires it (401 otherwise).
+- Raw bodies: add `RECEIVER_LOG_RAW=true`.
+- Filter check: `docker compose logs stream-receiver | grep -c Humidity` → `0`.
+
+The receiver only ever gets data from Zabbix's native streaming; the simulator talks to `zabbix-server` only.
+
+### Propagation delay
+
+A created or modified connector takes effect on the next configuration cache reload
+(`CacheUpdateFrequency`, 10 s here). To apply it immediately:
+
+```bash
+docker exec zabbix-server zabbix_server -R config_cache_reload
+```
+
+Until then the previous settings are used. For example, right after adding a token the receiver may reject a
+request with 401, and Zabbix does not retry 401.
+
+### Network targets
+
+The URL is resolved **from inside the `zabbix-server` container**:
+
+- **`localhost` is the Zabbix Server container itself**, not your machine nor another container. Don't use it.
+- **Receiver in this Compose project**: use the service name, e.g. `http://stream-receiver:8090/v1/history`.
+  A container from another project must join the `demo-zabbix_zabbix-net` network.
+- **App on the Docker host**: `http://host.docker.internal:<port>/<path>`.
+  - Docker Desktop (macOS/Windows): works out of the box.
+  - Linux: needs `extra_hosts: ["host.docker.internal:host-gateway"]` on `zabbix-server` (already in
+    `docker-compose.yml`). The app must listen on an interface reachable from the Docker bridge
+    (e.g. `0.0.0.0`, not only `127.0.0.1`) and the firewall must allow it.
+
+### Receiver contract
+
+What a consumer must accept (Zabbix streaming protocol v1.0, item values):
+
+- `POST` to the configured URL (used as-is; the docs name it `/v1/history` for item values).
+- `Content-Type: application/x-ndjson`.
+- `Authorization: Bearer <token>` when a token is configured.
+- Body: **several JSON objects separated by newlines** in a single request. **It is not a JSON array.**
+- Response: Zabbix treats 200–204 as success; the test receiver answers `200 {"response":"success"}`.
+  Errors should be 4xx with `{"error":"..."}`. Zabbix does **not** retry 400, 401, 403, 404, 405, 415 or 422
+  (that data is dropped); other codes and network errors are retried up to *Attempts* (1 here).
+
+Real payload captured in this lab (Zabbix 7.0.31, `RECEIVER_LOG_RAW=true`), one request:
+
+```
+{"host":{"host":"sim-sensor-01","name":"sim-sensor-01"},"groups":["Simulated Sensors"],"item_tags":[{"tag":"stream","value":"demo"}],"itemid":50740,"name":"Temperature","clock":1792498160,"ns":102386377,"value":23.97,"type":0}
+{"host":{"host":"sim-sensor-01","name":"sim-sensor-01"},"groups":["Simulated Sensors"],"item_tags":[{"tag":"stream","value":"demo"}],"itemid":50741,"name":"Voltage","clock":1792498160,"ns":102406460,"value":234.5,"type":0}
+```
+
+| Field | Type | Content |
+|---|---|---|
+| `host.host` / `host.name` | string | Technical / visible host name |
+| `groups` | string array | Host groups |
+| `item_tags` | array of `{tag, value}` | Item tags (may be empty) |
+| `itemid` | number | Item ID |
+| `name` | string | Visible item name |
+| `clock` / `ns` | number | Value timestamp (epoch seconds + nanoseconds) |
+| `value` | number or string | Collected value |
+| `type` | number | Value type: 0 float, 1 character, 2 log, 3 unsigned, 4 text, 5 binary |
+
+**The item key (`sim.temperature`) and units (`°C`, `V`) are not sent.** Consumers must identify metrics by
+`itemid` or `name`, or rely on extra item tags, which do travel in `item_tags`.
+
+### Switch to the real consumer
+
+1. Edit `.env`:
+   ```
+   STREAMING_ENABLED=true
+   STREAMING_URL=https://consumer.example.com/zabbix/history
+   STREAMING_BEARER_TOKEN=<real token, never committed>
+   ```
+2. Re-run the initializer. This works even if its container already exited successfully:
+   ```bash
+   docker compose run --rm zabbix-init
+   # or: docker compose up -d --force-recreate zabbix-init
+   ```
+3. Wait for the cache reload or force it with `config_cache_reload`.
+4. Stop the diagnostic receiver if no longer needed: `docker compose --profile streaming-test stop stream-receiver`.
+
+To turn streaming off, set `STREAMING_ENABLED=false` and repeat step 2. The connector is disabled, not deleted.
+
+---
+
 ## Troubleshooting
 
 ### ZBX badge stays red
@@ -327,9 +509,17 @@ The init container runs once automatically, but can be re-run manually:
 docker compose run --rm zabbix-init sh /init/setup-hosts.sh
 ```
 
+### Stream receiver gets nothing
+
+```bash
+docker compose logs zabbix-init | tail -5               # connector created/updated? URL valid?
+docker compose logs zabbix-server | grep -i connector   # connector worker started? send errors?
+docker exec zabbix-server zabbix_server -R config_cache_reload
+```
+
 ### Start completely fresh
 
 ```bash
-docker compose down -v   # removes DB volume
-docker compose up -d     # full rebuild from scratch
+docker compose --profile streaming-test down -v   # removes DB volume (and the receiver, if running)
+docker compose up -d                              # full rebuild from scratch
 ```
