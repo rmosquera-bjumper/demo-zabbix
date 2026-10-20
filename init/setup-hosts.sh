@@ -51,7 +51,8 @@ zbx() {
         -d "{\"jsonrpc\":\"2.0\",\"method\":\"${METHOD}\",\"params\":${PARAMS},\"id\":1}"
 }
 
-# Helper: get or create a host group, returns groupid
+# Helper: get or create a host group, returns groupid (logs go to stderr so
+# they are not captured together with the ID)
 get_or_create_group() {
     NAME="$1"
     EXISTING=$(zbx "hostgroup.get" "{\"filter\":{\"name\":[\"${NAME}\"]}}")
@@ -59,9 +60,9 @@ get_or_create_group() {
     if [ -z "${ID}" ]; then
         CREATED=$(zbx "hostgroup.create" "{\"name\":\"${NAME}\"}")
         ID=$(echo "${CREATED}" | jq -r '.result.groupids[0]')
-        echo "  Created group '${NAME}': ${ID}"
+        echo "  Created group '${NAME}': ${ID}" >&2
     else
-        echo "  Found group '${NAME}': ${ID}"
+        echo "  Found group '${NAME}': ${ID}" >&2
     fi
     echo "${ID}"
 }
